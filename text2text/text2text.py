@@ -1,6 +1,7 @@
 from datasets import load_dataset, Dataset
 from transformers import TrainingArguments, Trainer
 from transformers import AutoTokenizer
+from transformers import TrainerCallback
 import numpy as np
 import evaluate
 from transformers import TrainingArguments
@@ -8,10 +9,138 @@ from transformers import AutoModelForCausalLM
 import json
 import torch
 import random
+import os
+import matplotlib.pyplot as plt
 from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
-from nltk.translate.bleu_score import sentence_bleu
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from sentence_transformers import SentenceTransformer
+import torch.nn.functional as F
 
 use_lora = True
+curve_save_path = "./results/training_curves.png"
+metric_history_path = "./results/metric_history.json"
+
+
+def load_eval_encoder():
+    candidates = ["../gte-base-local", "thenlper/gte-base"]
+    for name in candidates:
+        try:
+            return SentenceTransformer(name, device=("cuda" if torch.cuda.is_available() else "cpu"))
+        except Exception as e:
+            print(f"Failed to load eval encoder {name}: {e}")
+    raise RuntimeError("Cannot load sentence embedding model for similarity evaluation.")
+
+
+def compute_generation_metrics(model, tokenizer, eval_pairs, eval_encoder, max_new_tokens=32):
+    if len(eval_pairs) == 0:
+        return 0.0, 0.0
+
+    smoothie = SmoothingFunction().method1
+    preds = []
+    refs = []
+    bleu_scores = []
+
+    model.eval()
+    for generation, target in eval_pairs:
+        prompt = f"Given the following text, predict the target:\n\nText: {generation}\n\nTarget:"
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False
+            )
+        generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        pred = generated_text[len(prompt):].strip()
+        preds.append(pred)
+        refs.append(target)
+        bleu_scores.append(
+            sentence_bleu(
+                [target.split()],
+                pred.split(),
+                weights=(0.25, 0.25, 0.25, 0.25),
+                smoothing_function=smoothie
+            )
+        )
+
+    pred_emb = eval_encoder.encode(preds, convert_to_tensor=True, normalize_embeddings=True)
+    ref_emb = eval_encoder.encode(refs, convert_to_tensor=True, normalize_embeddings=True)
+    cos_sim = F.cosine_similarity(pred_emb, ref_emb).mean().item()
+    bleu4 = float(np.mean(bleu_scores))
+    return cos_sim, bleu4
+
+
+def plot_training_curves(trainer, metric_history, save_path):
+    train_steps = []
+    train_losses = []
+    eval_epochs = []
+    eval_losses = []
+
+    for rec in trainer.state.log_history:
+        if "loss" in rec and "eval_loss" not in rec and "step" in rec:
+            train_steps.append(rec["step"])
+            train_losses.append(rec["loss"])
+        if "eval_loss" in rec and "epoch" in rec:
+            eval_epochs.append(rec["epoch"])
+            eval_losses.append(rec["eval_loss"])
+
+    metric_epochs = [m["epoch"] for m in metric_history]
+    metric_sims = [m["embedding_similarity"] for m in metric_history]
+    metric_bleu4 = [m["bleu4"] for m in metric_history]
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    axes[0].plot(train_steps, train_losses, label="train_loss")
+    if len(eval_epochs) > 0:
+        axes[0].plot(eval_epochs, eval_losses, marker="o", label="eval_loss")
+    axes[0].set_title("Loss")
+    axes[0].set_xlabel("step/epoch")
+    axes[0].set_ylabel("loss")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    axes[1].plot(metric_epochs, metric_sims, marker="o")
+    axes[1].set_title("Embedding Similarity")
+    axes[1].set_xlabel("epoch")
+    axes[1].set_ylabel("cosine similarity")
+    axes[1].grid(alpha=0.3)
+
+    axes[2].plot(metric_epochs, metric_bleu4, marker="o")
+    axes[2].set_title("BLEU-4")
+    axes[2].set_xlabel("epoch")
+    axes[2].set_ylabel("BLEU-4")
+    axes[2].grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=200)
+    plt.close(fig)
+
+
+class GenerationMetricCallback(TrainerCallback):
+    def __init__(self, eval_pairs, tokenizer, eval_encoder, metric_history):
+        self.eval_pairs = eval_pairs
+        self.tokenizer = tokenizer
+        self.eval_encoder = eval_encoder
+        self.metric_history = metric_history
+
+    def on_epoch_end(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return control
+        cos_sim, bleu4 = compute_generation_metrics(
+            model=model,
+            tokenizer=self.tokenizer,
+            eval_pairs=self.eval_pairs,
+            eval_encoder=self.eval_encoder
+        )
+        rec = {
+            "epoch": float(state.epoch),
+            "embedding_similarity": float(cos_sim),
+            "bleu4": float(bleu4)
+        }
+        self.metric_history.append(rec)
+        print(f"[epoch {state.epoch:.2f}] embedding_similarity={cos_sim:.4f}, bleu4={bleu4:.4f}")
+        return control
 
 # Load data
 path = '/share/shmatikov/collin/adversarial_decoding/data/emb_inv_attack_unnatural_gte-Qwen_20250312_192926.json'
@@ -143,6 +272,9 @@ eval_dataset = Dataset.from_dict({
 train_dataset = train_dataset.map(preprocess_function, batched=True)
 eval_dataset = eval_dataset.map(preprocess_function, batched=True)
 
+eval_encoder = load_eval_encoder()
+metric_history = []
+
 # Define training arguments
 if use_lora:
     # LoRA training arguments
@@ -186,6 +318,7 @@ trainer = Trainer(
     train_dataset=train_dataset,
     eval_dataset=eval_dataset,
     tokenizer=tokenizer,
+    callbacks=[GenerationMetricCallback(eval_data, tokenizer, eval_encoder, metric_history)],
 )
 
 # Evaluate the model before training to get baseline loss
@@ -197,6 +330,12 @@ print("=" * 50)
 
 # Train the model
 trainer.train()
+
+plot_training_curves(trainer, metric_history, curve_save_path)
+with open(metric_history_path, "w") as f:
+    json.dump(metric_history, f, indent=2)
+print(f"Training curves saved to {curve_save_path}")
+print(f"Metric history saved to {metric_history_path}")
 
 # Save the fine-tuned model
 if use_lora:

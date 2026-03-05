@@ -48,7 +48,7 @@ class EmbInvDecoding(DecodingStrategy):
         self.chat_format = ChatFormat(self.chat_prefix, self.chat_suffix, always_suffix=True)
         self.repetition_penalty = repetition_penalty
     
-    def get_combined_scorer(self, prompt, target):
+    def get_combined_scorer(self, prompt, target, init_text=None):
         # Convert prompt to tokens
         prompt_tokens = self.tokenizer.encode(prompt, add_special_tokens=False)
         if type(target) == str:
@@ -96,5 +96,9 @@ class EmbInvDecoding(DecodingStrategy):
             )
         
         # Initialize candidate
-        init_candidate = Candidate(token_ids=[], score=0.0)
+        if init_text:
+            init_ids = self.tokenizer.encode(init_text, add_special_tokens=False)
+            init_candidate = Candidate(token_ids=init_ids, score=0.0) # 这里可能要算一下初始分数
+        else:
+            init_candidate = Candidate(token_ids=[], score=0.0)
         return llm_wrapper, combined_scorer, init_candidate 

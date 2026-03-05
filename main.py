@@ -73,6 +73,12 @@ def main():
         default="gte",
         help="Encoder name"
     )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=None,
+        help="Target number of samples for emb_inv experiment"
+    )
     args = parser.parse_args()
     
     # Common beam search parameters
@@ -116,6 +122,7 @@ def main():
         emb_inv_experiment(
             encoder_name=args.encoder_name,
             should_natural=args.natural,
+            num_samples=args.num_samples,
             **beam_params
         )
         # python main.py --experiment emb_inv --encoder_name gte --beam_width 30 --max_steps 32 --top_k 30 --top_p 1

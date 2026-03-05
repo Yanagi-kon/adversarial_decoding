@@ -12,7 +12,7 @@ class DecodingStrategy:
     All strategies must implement get_combined_scorer.
     """
 
-    def get_combined_scorer(self, prompt, target):
+    def get_combined_scorer(self, prompt, target, init_text=None):
         """
         Create and return the LLMWrapper, combined scorer, and initial candidate
         for the specific strategy.
@@ -29,12 +29,13 @@ class DecodingStrategy:
         top_p=0.95,
         should_full_sent=True,
         verbose=False,
-        randomness=False
+        randomness=False,
+        init_text=None
     ) -> Candidate:
         """
         Orchestrates a beam search using combined scorers.
         """
-        llm_wrapper, combined_scorer, init_candidate = self.get_combined_scorer(prompt, target)
+        llm_wrapper, combined_scorer, init_candidate = self.get_combined_scorer(prompt, target, init_text=init_text)
         self.llm_wrapper = llm_wrapper
         self.combined_scorer = combined_scorer
 
